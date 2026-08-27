@@ -1,0 +1,88 @@
+name: Build Authored Models and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_assets:
+        description: Commit the 360 generated GLBs to main
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-models-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Blender
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y blender python3-numpy
+
+      - name: Build 360 independently constructed GLBs
+        run: blender -b --python-exit-code 1 --python tools/blender/build_authored_models.py -- --output public/models --variants 8
+
+      - name: Reject missing or duplicated model families
+        run: |
+          count="$(find public/models -name '*.glb' -type f | wc -l)"
+          echo "Generated ${count} of 360 GLB models"
+          test "$count" -eq 360
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          root = Path("public/models")
+          bases = sorted(path for path in root.glob("*/*.glb") if "_v" not in path.stem)
+          if len(bases) != 45:
+              raise SystemExit(f"Expected 45 model families, found {len(bases)}")
+          for base in bases:
+              paths = [base] + [base.with_name(f"{base.stem}_v{variant}.glb") for variant in range(2, 9)]
+              missing = [str(path) for path in paths if not path.is_file()]
+              if missing:
+                  raise SystemExit(f"Missing variants for {base}: {missing}")
+              hashes = {sha256(path.read_bytes()).hexdigest() for path in paths}
+              if len(hashes) != 8:
+                  raise SystemExit(f"Duplicate GLB data detected in {base.parent.name}/{base.stem}")
+          print("Validated 45 families with 8 distinct GLBs each")
+          PY
+
+      - name: Upload authored model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deeping-authored-models
+          path: public/models
+          if-no-files-found: error
+
+      - name: Commit generated models
+        if: ${{ inputs.commit_assets }}
+        run: |
+          git config user.name "deeping-asset-forge"
+          git config user.email "actions@users.noreply.github.com"
+          git add public/models
+          git diff --cached --quiet || git commit -m "Replace remixed GLBs with authored model variants"
+          git push
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run build
+      - uses: actions/configure-pages@v4
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - uses: actions/deploy-pages@v4
+        id: deployment
